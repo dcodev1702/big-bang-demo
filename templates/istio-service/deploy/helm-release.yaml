@@ -1,0 +1,39 @@
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: {{coral.app}}
+  namespace: bigbang    
+spec:
+  chart:
+    spec:
+      chart: "./chart"
+      sourceRef:
+        kind: GitRepository
+        name: {{coral.app}}
+  install: {}
+  interval: 1m
+  targetNamespace: {{coral.app}}
+  dependsOn:
+    - name: istio
+      namespace: bigbang
+    - name: bigbang
+      namespace: bigbang
+  valuesFrom:
+    - kind: Secret
+      name: common-bb
+      valuesKey: values.yaml
+  values:
+    nameOverride: {{coral.app}}
+    fullnameOverride: {{coral.app}}
+    replicas: {{replicas}}
+    istio:
+      gateways:
+      - 'istio-system/public'
+      hosts:
+      - '{{coral.app}}.bigbang.dev'
+    image:
+      repository: {{image}}
+      tag: {{tag}}
+      pullSecret: private-registry
+    service:
+      port: {{port}}

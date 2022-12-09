@@ -1,0 +1,4 @@
+manifests: ./deploy
+parameters:
+  image: {}
+  port: {}

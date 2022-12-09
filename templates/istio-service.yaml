@@ -1,0 +1,7 @@
+kind: ApplicationTemplate
+metadata:
+  name: istio-service
+spec:
+  repo: https://github.com/csemissionplatformops/big-bang-control-plane-seed
+  ref: main
+  path: templates/istio-service/template.yaml

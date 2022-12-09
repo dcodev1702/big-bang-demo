@@ -1,0 +1,257 @@
+name: Deploy Platform One Big Bang
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'clusters/**'
+
+env:
+  # The GitOps Repository Reference Managed by Coral
+  GITOPS_REPO: "${{ github.repository }}-gitops"
+  CORAL_LOG_FILE: coral.log
+  # Coral's Cluster being targeted for this deployment
+  CLUSTER_TARGET: dev
+  # The Docker Base Image Repository used for the Software Factory Stacks
+  P1_REGISTRY_NAME: registry1.dso.mil
+  # Image Registry Credentials
+  P1_REGISTRY_USERNAME: ${{ secrets.P1_REGISTRY_USERNAME }}
+  P1_REGISTRY_PASSWORD: ${{ secrets.P1_REGISTRY_PASSWORD }}
+  # The Github respository owner
+  REPO_OWNER: ${{ github.repository_owner }}
+  # Azure Keyvault name used to store the PGP and TLS KeyPairs 
+  KEYVAULT_NAME: 'vault-${{ secrets.CLUSTER_NAME }}'
+  # Source Code Repository used for the Software Factory
+  BB_REPO: "https://repo1.dso.mil/platform-one/big-bang/bigbang.git"
+  # Software Factory Version
+  BB_TAG: "1.41.0"
+  # Name of the K8 gpg secret resource used to source the SOPS encryption key
+  GPG_KEY_NAME: sops-gpg
+  # AKV SOPS GPG secret name 
+  AKV_GPG_SECRET_NAME: sops-gpg
+  # AKV TLS Certificate secret name
+  AKV_ISTIO_CRT_SECRET_NAME: istio-gw-crt
+  # AKV TLS Private Key secret name
+  AKV_ISTIO_KEY_SECRET_NAME: istio-gw-key
+  # The K8 Namespace used for the deployed software factory
+  K8_NAMESPACE: bigbang
+  # The Azure Cloud used for the IaC deployment (defaults to IL2)
+  CLOUD_NAME: azure
+  # The domain the software factory will use to host the platform services
+  DOMAIN: bigbang.dev
+  # The private docker registry hosting the micro services
+  GH_DOCKER_HOSTNAME: 'ghcr.io'
+
+jobs:
+  deploy-bigbang:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Configure Git
+      run: |
+        git config --global user.name github-actions
+        git config --global user.email github-actions@github.com
+        git config --global credential.helper store
+        mkdir -p ~/.config/git
+        echo "https://git:${{ secrets.GITOPS_PAT }}@github.com/" > ~/.config/git/credentials
+        
+    - name: Clone Control Plane Repo
+      uses: actions/checkout@v2
+      with:
+        repository: ${{ github.repository }}
+        path: 'controlplane'
+        token: ${{ secrets.GITOPS_PAT }}
+
+    - name: checkout tools-install repo
+      uses: actions/checkout@v3
+      with:
+        repository: benc-uk/tools-install
+        path: tools-install
+
+    - name: bootstrap local tools
+      shell: bash
+      run: |
+        chmod +x tools-install/**.sh
+        echo $HOME
+        mkdir -p $HOME/.local/bin
+        ls -la $HOME/.local/bin         
+        cd tools-install
+        ./base.sh
+        ./sops.sh
+        ./kustomize.sh
+        # ls -la $HOME/.local/bin
+        echo $PATH
+  
+    - name: Login to Azure Cloud with CLI
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        
+      # Deploy Bicep file
+    - name: AKS Deployment
+      env:
+        CLUSTER_NAME: 'aks-${{ secrets.CLUSTER_NAME }}'
+        RESOURCE_GROUP: ${{ secrets.CLUSTER_RESOURCE_GROUP }}
+        REGION: ${{ secrets.CLUSTER_REGION }}
+        IAC_TEMPLATE: './controlplane/infra/azure/main.bicep'
+        AZURE_CREDENTIALS: ${{ secrets.AZURE_CREDENTIALS }}
+      uses: azure/CLI@v1
+      with:
+        inlineScript: |
+          if [[ $(az aks list --resource-group $RESOURCE_GROUP --query "[?name=='$CLUSTER_NAME'] | length(@)") > 0 ]]
+          then
+            echo "Skipping cluster creation given AKS instance: $CLUSTER_NAME already exists"
+          else
+            echo "Creating cluster $CLUSTER_NAME"
+            CLIENTID=$(echo ${AZURE_CREDENTIALS:1:-1} | cut -d',' -f 1 | sed 's/clientId: //')
+            echo "CLIENT ID is $CLIENTID"
+            OBJECTID=$(az ad sp show --id $CLIENTID --query 'id' -o tsv)
+            az deployment sub create -f $IAC_TEMPLATE -l $REGION -n bigbang-cluster --parameters resGroupName=$RESOURCE_GROUP objectId=$OBJECTID location=$REGION suffix=${{ secrets.CLUSTER_NAME }}
+          fi
+  
+    - name: Create ISTIO certs
+      uses: azure/CLI@v1
+      with:
+        inlineScript: |
+          AKV_CERT_EXISTS_CHECK=$(az keyvault secret list --vault-name ${{ env.KEYVAULT_NAME }} --query "contains([].id, 'https://${{ env.KEYVAULT_NAME }}.vault.${{ env.CLOUD_NAME }}.net/secrets/${{ env.AKV_ISTIO_CRT_SECRET_NAME }}')")
+          if [[ "$AKV_CERT_EXISTS_CHECK" = true ]]; then
+            echo "Skip creating istio certificate as it already exists";
+          else
+            ## Create Certs
+            chmod +x ./controlplane/scripts/**.sh
+            ./controlplane/scripts/create-root-cert.sh
+            ./controlplane/scripts/create-domain-cert.sh $DOMAIN
+            ISTIO_GW_CRT=$(cat $DOMAIN.crt | base64 -w0)
+            ISTIO_GW_KEY=$(cat $DOMAIN.key | base64 -w0)
+            ## Store in AKV as secrets
+            az keyvault secret set --name ${{ env.AKV_ISTIO_CRT_SECRET_NAME }} --vault-name ${{ env.KEYVAULT_NAME }} --encoding base64 --value "$ISTIO_GW_CRT" > /dev/null
+            az keyvault secret set --name ${{ env.AKV_ISTIO_KEY_SECRET_NAME }} --vault-name ${{ env.KEYVAULT_NAME }} --encoding base64 --value "$ISTIO_GW_KEY" > /dev/null
+          fi;
+  
+    - name: Create SOPS PGP Private Key
+      shell: bash
+      working-directory: ./controlplane
+      run: | 
+        AKV_PGP_EXISTS_CHECK=$(az keyvault secret list --vault-name ${{ env.KEYVAULT_NAME }} --query "contains([].id, 'https://${{ env.KEYVAULT_NAME }}.vault.${{ env.CLOUD_NAME }}.net/secrets/${{ env.AKV_GPG_SECRET_NAME }}')")
+        if [[ "$AKV_PGP_EXISTS_CHECK" = true ]]; then
+          echo "Skip creating GPG key as it already exists";
+        else
+          ## Create GPG Key
+          echo "Creating GPG certificate ${{ env.AKV_GPG_SECRET_NAME }}"
+          ./scripts/create-gpg-key.sh ${{ env.AKV_GPG_SECRET_NAME }} ${{ env.KEYVAULT_NAME }} ${{ env.GPG_KEY_NAME }}
+        fi;
+    # Set the target Azure Kubernetes Service (AKS) cluster. 
+    - uses: azure/aks-set-context@v1
+      with:
+        creds: '${{ secrets.AZURE_CREDENTIALS }}'
+        cluster-name: 'aks-${{ secrets.CLUSTER_NAME }}'
+        resource-group: ${{ secrets.CLUSTER_RESOURCE_GROUP }}
+
+    - name: Create Initial Namespaces
+      run: |
+        for namespace in flux-system ${{ env.K8_NAMESPACE }}; do
+          NS_EXISTS=$(kubectl get namespace $namespace --ignore-not-found);
+          if [[ "$NS_EXISTS" ]]; then
+            echo "Skip creating namespace $namespace which already exists";
+          else
+            echo -e "\n\e[36m###\e[33m 📦 Creating namespaces $namespace\e[39m"
+            kubectl create namespace $namespace
+          fi;
+        done;
+    
+    - name: Create Private Git Repo Access Creds K8 Secret
+      uses: azure/k8s-create-secret@v1
+      with:
+        arguments: --from-literal=username=${{ env.REPO_OWNER }} --from-literal=password=${{ secrets.GITOPS_PAT }}
+        secret-type: generic
+        namespace: ${{ env.K8_NAMESPACE }}
+        secret-name: 'private-git'
+
+    - name: Create Private Application Docker Registry Access Creds K8 Secret
+      uses: azure/k8s-create-secret@v1
+      with:
+        container-registry-url: ${{ env.GH_DOCKER_HOSTNAME }}
+        container-registry-username: ${{ env.REPO_OWNER }}
+        container-registry-password: ${{ secrets.GITOPS_PAT }}
+        secret-type: docker-registry
+        namespace: 'flux-system'
+        secret-name: 'app-private-registry'
+
+    - name: Create Iron Bank Access Creds K8 Secret
+      uses: azure/k8s-create-secret@v1
+      with:
+        container-registry-url: ${{ env.P1_REGISTRY_NAME }}
+        container-registry-username: ${{ env.P1_REGISTRY_USERNAME }}
+        container-registry-password: ${{ env.P1_REGISTRY_PASSWORD }}
+        secret-type: docker-registry
+        namespace: 'flux-system'
+        secret-name: 'private-registry'
+
+    - name: Stage Big Bang Cluster
+      env:
+        AKV_GPG_SECRET_URI: "https://${{ env.KEYVAULT_NAME }}.vault.${{ env.CLOUD_NAME }}.net/secrets/${{ env.AKV_GPG_SECRET_NAME }}"
+        AKV_ISTIO_CRT_SECRET_URI: "https://${{ env.KEYVAULT_NAME }}.vault.${{ env.CLOUD_NAME }}.net/secrets/${{ env.AKV_ISTIO_CRT_SECRET_NAME }}"
+        AKV_ISTIO_KEY_SECRET_URI: "https://${{ env.KEYVAULT_NAME }}.vault.${{ env.CLOUD_NAME }}.net/secrets/${{ env.AKV_ISTIO_KEY_SECRET_NAME }}"
+        IRON_BANK_USER: ${{ secrets.P1_REGISTRY_USERNAME }}
+        IRON_BANK_PAT: ${{ secrets.P1_REGISTRY_PASSWORD }}
+        GPG_KEY_NAME: ${{ env.GPG_KEY_NAME }}
+        BB_REPO: ${{ env.BB_REPO }}
+        BB_TAG: ${{ env.BB_TAG }}
+        HOSTNAME: ${{ env.DOMAIN }}
+        REF_KEY: "$patch"
+        KEYVAULT_NAME: ${{ env.KEYVAULT_NAME }}
+        APP_DOCKER_HOSTNAME: ${{ env.GH_DOCKER_HOSTNAME }}
+        GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+        REPO_OWNER: ${{ env.REPO_OWNER }}
+        FILENAME: 'bigbang'
+      shell: bash
+      working-directory: ./controlplane
+      run: | 
+        ./scripts/deploy.sh
+    - name: Clone Cluster GitOps Repo
+      uses: actions/checkout@v2
+      with:
+        repository: ${{ env.GITOPS_REPO }}
+        path: 'gitops'
+        token: ${{ secrets.GITOPS_PAT }}
+
+    - name: Install Big Bang Flux Configuration onto Cluster
+      env:
+        DEPLOY_PATH: "./clusters/${{ env.CLUSTER_TARGET }}"
+        CLUSTER_DEFINITION: "./clusters/${{ env.CLUSTER_TARGET }}.yaml"
+        REPOSITORY: ${{ env.GITOPS_REPO }}
+      working-directory: ./controlplane
+      run: |
+        if [[ -f "$CLUSTER_DEFINITION" ]]; then
+          echo -e "\n\e[36m###\e[33m 💣 Deploying BigBang to cluster: ${{ env.CLUSTER_TARGET }} !\e[39m"
+          envsubst <./scripts/templates/bigbang.gitops.repository.template > cluster-deployment.yaml
+          kubectl apply -f cluster-deployment.yaml
+        fi
+    - name: Wait for Big Bang Deployment to complete
+      shell: bash
+      working-directory: ./controlplane
+      run: | 
+        ./scripts/wait_for_helm_releases.sh
+        
+    - name: Set up Python 3.10 for E2E Test Suite Harness
+      uses: actions/setup-python@v3
+      with:
+        python-version: "3.10"
+
+    - uses: actions/cache@v3
+      id: cache
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.*') }}
+        restore-keys: | 
+          ${{ runner.os }}-pip-
+    - name: Install Test Suite dependencies
+      working-directory: ./controlplane
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt        
+    - name: Run BigBang Test Suite
+      working-directory: ./controlplane
+      run: | 
+        pytest ./tests -v

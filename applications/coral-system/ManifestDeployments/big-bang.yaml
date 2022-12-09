@@ -1,0 +1,9 @@
+kind: ManifestDeployment
+metadata:
+  name: big-bang
+spec:
+  workspace: coral-system
+  manifests: big-bang
+  targets:
+    all:
+      clusters: all
